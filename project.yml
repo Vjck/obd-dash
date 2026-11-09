@@ -1,0 +1,30 @@
+name: ObdDash
+options:
+  bundleIdPrefix: com.obddash
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  ObdDash:
+    type: application
+    platform: iOS
+    sources: [Sources]
+    scheme: {}
+    info:
+      path: Support/Info.plist
+      properties:
+        CFBundleDisplayName: OBD Dash
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UILaunchScreen: {}
+        NSBluetoothAlwaysUsageDescription: "Serve per collegarsi al lettore OBD II dell'auto."
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.obddash.app
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"

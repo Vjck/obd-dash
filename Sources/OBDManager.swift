@@ -562,11 +562,7 @@ final class OBDManager: NSObject, ObservableObject {
         if (data.rpm ?? 0) > 0 {
             let dkm = Double(data.speed ?? 0) * dt / 3600
             let dl = (data.fuelRate ?? 0) * dt / 3600
-            store.kmSinceRegen += dkm
-            if data.fuelRate != nil {
-                store.totalKm += dkm
-                store.totalLitres += dl
-            }
+            store.add(km: dkm, litres: data.fuelRate != nil ? dl : nil)
             if var t = trip {
                 t.km += dkm
                 t.litres += dl

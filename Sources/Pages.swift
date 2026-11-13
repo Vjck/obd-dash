@@ -308,35 +308,19 @@ struct ErrorsView: View {
 // MARK: - Impostazioni
 
 struct SettingsView: View {
-    @EnvironmentObject private var obd: OBDManager
     @EnvironmentObject private var store: AppStore
     @Environment(\.dismiss) private var dismiss
+    // Kept here on purpose: the built-in EditButton loses its state when live data redraws the list.
+    @State private var editMode: EditMode = .inactive
 
     var body: some View {
         NavigationStack {
             List {
-                Section("Lettore OBD") {
-                    LabeledContent("Lettore", value: obd.connectedName ?? "–")
-                    LabeledContent("Stato", value: obd.connection.label)
-                    Button("Cambia lettore", role: .destructive) {
-                        obd.disconnectAndForget()
-                        dismiss()
-                    }
-                }
+                ReaderSection { dismiss() }
 
                 Section {
                     ForEach(store.order) { metric in
-                        Toggle(isOn: binding(metric)) {
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(metric.title)
-                                if !obd.isAvailable(metric) {
-                                    Text("Non fornito da questa auto")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                        .tint(Theme.green)
+                        MetricToggleRow(metric: metric)
                     }
                     .onMove { store.order.move(fromOffsets: $0, toOffset: $1) }
                 } header: {
@@ -361,19 +345,47 @@ struct SettingsView: View {
                     NavigationLink("Ricerca dati FAP") { DataSearchView() }
                 }
             }
+            .environment(\.editMode, $editMode)
             .navigationTitle("Impostazioni")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) { EditButton() }
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button(editMode == .active ? "Fatto" : "Modifica") {
+                        withAnimation { editMode = editMode == .active ? .inactive : .active }
+                    }
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Fine") { dismiss() }.fontWeight(.semibold)
                 }
             }
         }
     }
+}
 
-    private func binding(_ metric: Metric) -> Binding<Bool> {
-        Binding(
+/// Reader status. Separate view so its live updates do not redraw the whole settings list.
+private struct ReaderSection: View {
+    @EnvironmentObject private var obd: OBDManager
+    let onForget: () -> Void
+
+    var body: some View {
+        Section("Lettore OBD") {
+            LabeledContent("Lettore", value: obd.connectedName ?? "–")
+            LabeledContent("Stato", value: obd.connection.label)
+            Button("Cambia lettore", role: .destructive) {
+                obd.disconnectAndForget()
+                onForget()
+            }
+        }
+    }
+}
+
+private struct MetricToggleRow: View {
+    @EnvironmentObject private var obd: OBDManager
+    @EnvironmentObject private var store: AppStore
+    let metric: Metric
+
+    var body: some View {
+        Toggle(isOn: Binding(
             get: { store.enabled.contains(metric) },
             set: { isOn in
                 if isOn {
@@ -382,7 +394,17 @@ struct SettingsView: View {
                     store.enabled.remove(metric)
                 }
             }
-        )
+        )) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(metric.title)
+                if !obd.isAvailable(metric) {
+                    Text("Non fornito da questa auto")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .tint(Theme.green)
     }
 }
 

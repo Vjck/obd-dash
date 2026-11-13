@@ -119,6 +119,29 @@ final class AppStore: ObservableObject {
         persist()
     }
 
+    private var pendingKm = 0.0
+    private var pendingFuelKm = 0.0
+    private var pendingLitres = 0.0
+    private var lastFlush = Date.distantPast
+
+    /// Adds driven distance and fuel. Publishes at most every two seconds, so screens
+    /// that show these totals do not redraw on every sample.
+    func add(km: Double, litres: Double?) {
+        pendingKm += km
+        if let litres {
+            pendingFuelKm += km
+            pendingLitres += litres
+        }
+        guard Date().timeIntervalSince(lastFlush) >= 2 else { return }
+        lastFlush = Date()
+        if pendingKm > 0 { kmSinceRegen += pendingKm }
+        if pendingFuelKm > 0 { totalKm += pendingFuelKm }
+        if pendingLitres > 0 { totalLitres += pendingLitres }
+        pendingKm = 0
+        pendingFuelKm = 0
+        pendingLitres = 0
+    }
+
     func resetAverage() {
         totalLitres = 0
         totalKm = 0

@@ -775,6 +775,20 @@ final class OBDManager: NSObject, ObservableObject {
                     + self.supported.sorted().map { String(format: "%02X", $0) }.joined(separator: " "))
             }
             if let last = proto.last, last == "6" || last == "8" {
+                // Lock the protocol: in automatic mode the adapter starts a slow protocol
+                // search every time a request gets no answer.
+                _ = try? await self.send("ATTP" + String(last))
+                if first == 0 {
+                    // Two checks with the identifier every modern ECU has (chassis number),
+                    // to see whether this kind of request works at all.
+                    let broadcast = (try? await self.send("22F190", timeout: 5)) ?? "nessuna risposta"
+                    _ = try? await self.send("ATSH7E0")
+                    let direct = (try? await self.send("22F190", timeout: 5)) ?? "nessuna risposta"
+                    let raw = (try? await self.send("221800", timeout: 5)) ?? "nessuna risposta"
+                    self.scanResults.append("Prova generale: " + Self.oneLine(broadcast))
+                    self.scanResults.append("Prova diretta: " + Self.oneLine(direct))
+                    self.scanResults.append("Prova 1800: " + Self.oneLine(raw))
+                }
                 _ = try? await self.send("ATSH7E0")
                 // Shorter wait for the ECU: the adapter's default is 200 ms for every identifier.
                 _ = try? await self.send("ATAT2")
@@ -826,6 +840,7 @@ final class OBDManager: NSObject, ObservableObject {
                 _ = try? await self.send("ATST32")
                 _ = try? await self.send("ATAT1")
                 _ = try? await self.send("ATSH7DF")
+                _ = try? await self.send("ATSP0")
                 if stoppedEarly {
                     index = 0
                     self.scanResults.append("Interrotta: la centralina non risponde alle richieste di dati specifici (96 tentativi senza risposta)")
@@ -846,6 +861,14 @@ final class OBDManager: NSObject, ObservableObject {
             self.scanTask = nil
             if self.peripheral != nil, self.connection == .connected { self.startPolling() }
         }
+    }
+
+    /// Keeps only the first 60 characters of a reply, on one line, with the chassis number hidden.
+    private static func oneLine(_ reply: String) -> String {
+        let flat = reply.replacingOccurrences(of: "\n", with: " | ")
+        let compact = flat.replacingOccurrences(of: " ", with: "")
+        if compact.contains("62F190") { return "risposta positiva (62 F190)" }
+        return String(flat.prefix(60))
     }
 
     func stopDataSearch() {

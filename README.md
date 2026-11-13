@@ -18,7 +18,9 @@ App iOS personale (stile Sidecar) che legge i dati della centralina tramite un l
 
 **v0.4:** ricerca dei dati specifici della centralina (Impostazioni > Ricerca dati FAP) e log completo della fase di collegamento.
 
-Prossimi passi: dati FAP specifici Opel, Live Activity su CarPlay.
+**v0.5:** Live Activity con velocità, giri e i primi quattro dati del cruscotto su CarPlay, schermata di blocco e Dynamic Island (estensione in `Widgets/`, dati condivisi in `Shared/`). Richiede iOS 18 o successivo.
+
+Prossimo passo: dati FAP specifici Opel.
 
 ## Come ottenere l'app
 

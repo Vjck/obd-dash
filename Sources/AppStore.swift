@@ -24,6 +24,19 @@ enum Metric: String, CaseIterable, Codable, Identifiable {
         }
     }
 
+    /// Short label for the small Live Activity layout.
+    var shortTitle: String {
+        switch self {
+        case .fuelInstant: return "Consumo"
+        case .fuelAverage: return "Media"
+        case .ambient: return "Esterna"
+        case .load: return "Carico"
+        case .intakeTemp: return "Aria"
+        case .fuelLevel: return "Carburante"
+        default: return title
+        }
+    }
+
     static let defaultEnabled: Set<Metric> = [.fuelInstant, .fuelAverage, .boost, .coolant, .battery, .dpf]
 }
 
@@ -55,6 +68,7 @@ final class AppStore: ObservableObject {
     @Published var enabled: Set<Metric> { didSet { persist() } }
     @Published var tankLitres: Double { didSet { persist() } }
     @Published var fuelCalibration: Double { didSet { persist() } }
+    @Published var liveActivity: Bool { didSet { persist() } }
     @Published var trips: [Trip]
     @Published var regens: [Regen]
     @Published var totalLitres: Double
@@ -66,6 +80,7 @@ final class AppStore: ObservableObject {
         var enabled: [Metric]
         var tankLitres: Double
         var fuelCalibration: Double
+        var liveActivity: Bool?
         var trips: [Trip]
         var regens: [Regen]
         var totalLitres: Double
@@ -86,6 +101,7 @@ final class AppStore: ObservableObject {
         self.enabled = saved.map { Set($0.enabled) } ?? Metric.defaultEnabled
         self.tankLitres = saved?.tankLitres ?? 45
         self.fuelCalibration = saved?.fuelCalibration ?? 1.0
+        self.liveActivity = saved?.liveActivity ?? true
         self.trips = saved?.trips ?? []
         self.regens = saved?.regens ?? []
         self.totalLitres = saved?.totalLitres ?? 0
@@ -97,7 +113,7 @@ final class AppStore: ObservableObject {
 
     func persist() {
         let p = Persisted(order: order, enabled: Array(enabled), tankLitres: tankLitres,
-                          fuelCalibration: fuelCalibration, trips: trips, regens: regens,
+                          fuelCalibration: fuelCalibration, liveActivity: liveActivity, trips: trips, regens: regens,
                           totalLitres: totalLitres, totalKm: totalKm, kmSinceRegen: kmSinceRegen)
         if let raw = try? JSONEncoder().encode(p) {
             UserDefaults.standard.set(raw, forKey: Self.key)

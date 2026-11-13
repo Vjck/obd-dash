@@ -3,4 +3,4 @@ build/
 Payload/
 *.ipa
 .DS_Store
-Support/Info.plist
+Support/

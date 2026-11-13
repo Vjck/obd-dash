@@ -81,6 +81,7 @@ final class OBDManager: NSObject, ObservableObject {
     @Published private(set) var scanResults: [String] = UserDefaults.standard.stringArray(forKey: "scanResults") ?? []
 
     private let store: AppStore
+    private let live = LiveActivityController()
     private var central: CBCentralManager!
     private var discovered: [UUID: CBPeripheral] = [:]
     private var peripheral: CBPeripheral?
@@ -464,6 +465,7 @@ final class OBDManager: NSObject, ObservableObject {
                 }
                 if timeouts >= 6 {
                     self.connection = .failed("Il lettore ha smesso di rispondere")
+                    self.live.end()
                     return
                 }
                 self.integrate()
@@ -475,6 +477,24 @@ final class OBDManager: NSObject, ObservableObject {
     private func stopPolling() {
         pollTask?.cancel()
         pollTask = nil
+        live.end()
+    }
+
+    /// Sends the current values to the Live Activity (first four dashboard tiles).
+    private func pushLive() {
+        guard store.liveActivity else {
+            live.end()
+            return
+        }
+        let items = store.visibleMetrics.prefix(4).map { metric -> DriveAttributes.Item in
+            let shown = display(metric)
+            return DriveAttributes.Item(title: metric.shortTitle, value: shown.value, unit: shown.unit)
+        }
+        var regen: Int?
+        if let since = regenSince { regen = Int(Date().timeIntervalSince(since) / 60) }
+        live.push(DriveAttributes.ContentState(speed: data.speed ?? 0, rpm: data.rpm ?? 0,
+                                               items: Array(items), regenMinutes: regen),
+                  carName: connectedName ?? "Auto")
     }
 
     private func read(_ pid: String) async throws {
@@ -557,6 +577,7 @@ final class OBDManager: NSObject, ObservableObject {
     private func integrate() {
         let now = Date()
         defer { lastSample = now }
+        pushLive()
         guard !isDemo, let last = lastSample else { return }
         let dt = min(now.timeIntervalSince(last), 5)
         if (data.rpm ?? 0) > 0 {
@@ -694,6 +715,7 @@ final class OBDManager: NSObject, ObservableObject {
                 d.egt = 298
                 d.mil = !self.dtcs.isEmpty
                 self.data = d
+                self.pushLive()
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
         }

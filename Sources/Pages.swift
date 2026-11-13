@@ -340,6 +340,14 @@ struct SettingsView: View {
                     Text("Se dopo un pieno i litri reali sono diversi da quelli calcolati, regola la correzione. Esempio: reali 40 l, calcolati 36 l, imposta 111 %.")
                 }
 
+                Section {
+                    Toggle("Live Activity", isOn: $store.liveActivity).tint(Theme.green)
+                } header: {
+                    Text("CarPlay e schermata di blocco")
+                } footer: {
+                    Text("Mostra velocità, giri e i primi quattro dati del cruscotto su CarPlay, sulla schermata di blocco e nella Dynamic Island. Parte quando il lettore è collegato e l'app è aperta.")
+                }
+
                 Section("Diagnostica") {
                     NavigationLink("Log del lettore") { LogView() }
                     NavigationLink("Ricerca dati FAP") { DataSearchView() }

@@ -2,13 +2,21 @@ name: ObdDash
 options:
   bundleIdPrefix: com.obddash
   deploymentTarget:
-    iOS: "16.0"
+    iOS: "18.0"
+settings:
+  base:
+    MARKETING_VERSION: "0.5.0"
+    CURRENT_PROJECT_VERSION: "6"
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "1"
 targets:
   ObdDash:
     type: application
     platform: iOS
-    sources: [Sources]
+    sources: [Sources, Shared]
     scheme: {}
+    dependencies:
+      - target: ObdDashWidgets
     info:
       path: Support/Info.plist
       properties:
@@ -19,6 +27,7 @@ targets:
         UILaunchScreen: {}
         UIBackgroundModes:
           - bluetooth-central
+        NSSupportsLiveActivities: true
         NSBluetoothAlwaysUsageDescription: "Serve per collegarsi al lettore OBD II dell'auto."
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -27,7 +36,19 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.obddash.app
-        MARKETING_VERSION: "0.4.1"
-        CURRENT_PROJECT_VERSION: "5"
-        SWIFT_VERSION: "5.0"
-        TARGETED_DEVICE_FAMILY: "1"
+  ObdDashWidgets:
+    type: app-extension
+    platform: iOS
+    sources: [Widgets, Shared]
+    info:
+      path: Support/Widgets-Info.plist
+      properties:
+        CFBundleDisplayName: OBD Dash
+        CFBundleDevelopmentRegion: it
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.obddash.app.widgets

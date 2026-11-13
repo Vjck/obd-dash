@@ -445,20 +445,29 @@ struct LogView: View {
 struct DataSearchView: View {
     @EnvironmentObject private var obd: OBDManager
 
+    private var remaining: String {
+        guard let s = obd.scanRemaining else { return "" }
+        return s < 60 ? " · meno di un minuto" : " · circa \((s + 59) / 60) min"
+    }
+
     var body: some View {
         List {
             Section {
                 if let progress = obd.scanProgress {
                     ProgressView(value: progress) {
-                        Text("Ricerca in corso: \(Int(progress * 100)) %")
+                        Text("Ricerca in corso: \(Int(progress * 100)) %" + remaining)
                     }
                     Button("Interrompi", role: .destructive) { obd.stopDataSearch() }
                 } else {
-                    Button("Avvia ricerca") { obd.startDataSearch() }
+                    if obd.canResumeSearch {
+                        Button("Riprendi ricerca") { obd.startDataSearch(resume: true) }
+                            .disabled(obd.connection != .connected || obd.isDemo)
+                    }
+                    Button(obd.canResumeSearch ? "Ricomincia da capo" : "Avvia ricerca") { obd.startDataSearch() }
                         .disabled(obd.connection != .connected || obd.isDemo)
                 }
             } footer: {
-                Text("Chiede alla centralina motore quali dati specifici fornisce. Legge soltanto, non modifica nulla. Dura circa 15 minuti: tieni il motore acceso al minimo, l'auto ferma e l'app aperta. Durante la ricerca il cruscotto resta fermo.")
+                Text("Chiede alla centralina motore quali dati specifici fornisce. Legge soltanto, non modifica nulla. Tieni il motore acceso al minimo, l'auto ferma e l'app aperta. Puoi interrompere e riprendere più tardi: i risultati trovati restano salvati. Durante la ricerca il cruscotto resta fermo.")
             }
 
             Section("Risultati (\(obd.scanResults.count))") {

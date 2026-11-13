@@ -746,26 +746,59 @@ final class OBDManager: NSObject, ObservableObject {
         0x1800...0x19FF, 0x3800...0x38FF, 0x1000...0x17FF, 0x2000...0x24FF, 0x3000...0x33FF, 0x4000...0x45FF,
     ]
 
+    /// Where an interrupted search stopped, so it can continue from there.
+    @Published private(set) var scanPosition: Int = UserDefaults.standard.integer(forKey: "scanPosition")
+    /// Estimated seconds left in the running search.
+    @Published private(set) var scanRemaining: Int?
+
+    private static var scanIDs: [Int] { scanRanges.flatMap { Array($0) } }
+
+    var canResumeSearch: Bool { scanPosition > 0 && scanPosition < Self.scanIDs.count }
+
     /// Asks the engine ECU for every identifier in the ranges and keeps the ones it answers.
     /// Read-only: service 22 only reads values. Live polling is paused meanwhile.
-    func startDataSearch() {
+    /// With `resume` it continues from where the previous search stopped.
+    func startDataSearch(resume: Bool = false) {
         guard connection == .connected, !isDemo, scanTask == nil else { return }
         stopPolling()
-        scanResults = []
-        scanProgress = 0
+        let ids = Self.scanIDs
+        let first = resume && canResumeSearch ? scanPosition : 0
+        if first == 0 { scanResults = [] }
+        scanProgress = Double(first) / Double(ids.count)
+        scanRemaining = nil
         scanTask = Task {
-            let ids = Self.scanRanges.flatMap { Array($0) }
-            var negative = 0, silent = 0
+            var negative = 0, silent = 0, found = 0
+            var stoppedEarly = false
             let proto = (try? await self.send("ATDPN")) ?? "?"
-            self.scanResults.append("Protocollo \(proto) · PID standard: "
-                + self.supported.sorted().map { String(format: "%02X", $0) }.joined(separator: " "))
+            if first == 0 {
+                self.scanResults.append("Protocollo \(proto) · PID standard: "
+                    + self.supported.sorted().map { String(format: "%02X", $0) }.joined(separator: " "))
+            }
             if let last = proto.last, last == "6" || last == "8" {
                 _ = try? await self.send("ATSH7E0")
-                for (index, id) in ids.enumerated() {
+                // Shorter wait for the ECU: the adapter's default is 200 ms for every identifier.
+                _ = try? await self.send("ATAT2")
+                _ = try? await self.send("ATST19")
+                // A trailing "1" tells the adapter to return after the first reply instead of
+                // waiting for the timeout. Some clones do not understand it and answer "?".
+                var suffix = "1"
+                let began = Date()
+                var index = first
+                while index < ids.count {
                     if Task.isCancelled || self.peripheral == nil { break }
-                    let did = String(format: "%04X", id)
-                    if let reply = try? await self.send("22" + did, timeout: 3, quiet: true) {
+                    let did = String(format: "%04X", ids[index])
+                    var reply = try? await self.send("22" + did + suffix, timeout: 1.5, quiet: true)
+                    if suffix == "1", let r = reply, r.contains("?") {
+                        suffix = ""
+                        reply = try? await self.send("22" + did, timeout: 1.5, quiet: true)
+                    }
+                    if var reply {
+                        if suffix == "1", reply.replacingOccurrences(of: " ", with: "").contains("62" + did) {
+                            // Ask again without the limit, so long answers arrive complete.
+                            reply = (try? await self.send("22" + did, timeout: 3, quiet: true)) ?? reply
+                        }
                         if let bytes = Self.payloads(reply, prefix: "62" + did).first {
+                            found += 1
                             self.scanResults.append(did + ": " + bytes.map { String(format: "%02X", $0) }.joined())
                             UserDefaults.standard.set(self.scanResults, forKey: "scanResults")
                         } else if reply.replacingOccurrences(of: " ", with: "").contains("7F22") {
@@ -776,16 +809,40 @@ final class OBDManager: NSObject, ObservableObject {
                     } else {
                         silent += 1
                     }
-                    if index % 8 == 0 { self.scanProgress = Double(index) / Double(ids.count) }
+                    index += 1
+                    let done = index - first
+                    if done == 96, found == 0, negative == 0 {
+                        stoppedEarly = true
+                        break
+                    }
+                    if done % 16 == 0 {
+                        self.scanPosition = index
+                        UserDefaults.standard.set(index, forKey: "scanPosition")
+                        self.scanProgress = Double(index) / Double(ids.count)
+                        let perID = Date().timeIntervalSince(began) / Double(done)
+                        self.scanRemaining = Int(perID * Double(ids.count - index))
+                    }
                 }
+                _ = try? await self.send("ATST32")
+                _ = try? await self.send("ATAT1")
                 _ = try? await self.send("ATSH7DF")
-                self.scanResults.append("Fine · rifiutati \(negative), senza risposta \(silent)"
-                    + (Task.isCancelled ? " · interrotta" : ""))
+                if stoppedEarly {
+                    index = 0
+                    self.scanResults.append("Interrotta: la centralina non risponde alle richieste di dati specifici (96 tentativi senza risposta)")
+                } else {
+                    let seconds = Int(Date().timeIntervalSince(began))
+                    self.scanResults.append("\(index >= ids.count ? "Fine" : "Interrotta a \(index) di \(ids.count)")"
+                        + " · rifiutati \(negative), senza risposta \(silent), \(seconds) s"
+                        + (suffix.isEmpty ? " · modo lento" : ""))
+                }
+                self.scanPosition = index >= ids.count ? 0 : index
+                UserDefaults.standard.set(self.scanPosition, forKey: "scanPosition")
             } else {
                 self.scanResults.append("Ricerca non possibile: protocollo non previsto")
             }
             UserDefaults.standard.set(self.scanResults, forKey: "scanResults")
             self.scanProgress = nil
+            self.scanRemaining = nil
             self.scanTask = nil
             if self.peripheral != nil, self.connection == .connected { self.startPolling() }
         }

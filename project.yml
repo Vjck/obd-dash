@@ -16,6 +16,8 @@ targets:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UILaunchScreen: {}
+        UIBackgroundModes:
+          - bluetooth-central
         NSBluetoothAlwaysUsageDescription: "Serve per collegarsi al lettore OBD II dell'auto."
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -24,7 +26,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.obddash.app
-        MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.2.0"
+        CURRENT_PROJECT_VERSION: "2"
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1"

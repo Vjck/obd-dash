@@ -2,12 +2,12 @@ import SwiftUI
 
 @main
 struct ObdDashApp: App {
-    @StateObject private var ble = BLEManager()
+    @StateObject private var obd = OBDManager()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .environmentObject(ble)
+                .environmentObject(obd)
                 .preferredColorScheme(.dark)
         }
     }

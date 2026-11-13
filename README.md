@@ -8,7 +8,9 @@ App iOS personale (stile Sidecar) che legge i dati della centralina tramite un l
 
 ## Stato
 
-**v0.1 (passo 1):** l'app cerca i dispositivi Bluetooth LE vicini, per verificare che il lettore OBD sia visibile.
+**v0.2 (passo 2):** collegamento al lettore ELM327 via Bluetooth LE e cruscotto live con velocità, giri, pressione turbo, temperatura liquido e aria aspirata, carico motore e tensione batteria. L'app ricorda il lettore e si ricollega da sola. Il pulsante **Log** mostra lo scambio di comandi con il lettore (utile per il debug: "Copia" e incollalo nella chat).
+
+Prossimi passi: Live Activity su CarPlay, codici di errore e storico viaggi, consumi.
 
 ## Come ottenere l'app
 

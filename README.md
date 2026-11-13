@@ -16,7 +16,9 @@ App iOS personale (stile Sidecar) che legge i dati della centralina tramite un l
 - **Errori:** lettura e cancellazione dei codici, stato della spia motore.
 - **Impostazioni:** scelta e ordine dei dati, serbatoio, correzione dei consumi, log del lettore, modalità dimostrativa.
 
-Prossimo passo: Live Activity su CarPlay.
+**v0.4:** ricerca dei dati specifici della centralina (Impostazioni > Ricerca dati FAP) e log completo della fase di collegamento.
+
+Prossimi passi: dati FAP specifici Opel, Live Activity su CarPlay.
 
 ## Come ottenere l'app
 

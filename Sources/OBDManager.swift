@@ -75,6 +75,10 @@ final class OBDManager: NSObject, ObservableObject {
     @Published private(set) var dtcReadAt: Date?
     @Published private(set) var dtcBusy = false
     @Published private(set) var log: [String] = []
+    /// First lines after each connection (services, setup, supported PIDs): never rotated out.
+    @Published private(set) var headLog: [String] = []
+    @Published private(set) var scanProgress: Double?
+    @Published private(set) var scanResults: [String] = UserDefaults.standard.stringArray(forKey: "scanResults") ?? []
 
     private let store: AppStore
     private var central: CBCentralManager!
@@ -88,6 +92,7 @@ final class OBDManager: NSObject, ObservableObject {
     private var rxBuffer = ""
     private var pending: CheckedContinuation<String, Error>?
     private var requestID = UUID()
+    private var quietReply = false
     private var busy = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
@@ -102,6 +107,8 @@ final class OBDManager: NSObject, ObservableObject {
     private var hotSince: Date?
     private var coolSince: Date?
     private var regenKm = 0.0
+    private var capturingHead = false
+    private var scanTask: Task<Void, Never>?
 
     private static let lastDeviceKey = "lastDeviceID"
 
@@ -210,6 +217,8 @@ final class OBDManager: NSObject, ObservableObject {
         p.delegate = self
         connectedName = p.name
         connection = .connecting
+        headLog = []
+        capturingHead = true
         appendLog("Collegamento a \(p.name ?? p.identifier.uuidString)")
         central.connect(p, options: nil)
     }
@@ -269,12 +278,13 @@ final class OBDManager: NSObject, ObservableObject {
 
     /// Sends one command and returns the adapter's reply (text before the '>' prompt).
     /// Commands are serialised: only one is on the wire at a time.
-    func send(_ command: String, timeout: TimeInterval = 4) async throws -> String {
+    func send(_ command: String, timeout: TimeInterval = 4, quiet: Bool = false) async throws -> String {
         await acquire()
         defer { release() }
         guard let p = peripheral, let tx = txChar else { throw OBDError.notConnected }
         rxBuffer = ""
-        appendLog("> \(command)")
+        quietReply = quiet
+        if !quiet { appendLog("> \(command)") }
         let id = UUID()
         requestID = id
         return try await withCheckedThrowingContinuation { cont in
@@ -308,7 +318,7 @@ final class OBDManager: NSObject, ObservableObject {
             .filter { !$0.isEmpty && $0 != "SEARCHING..." }
             .joined(separator: "\n")
         rxBuffer = String(rxBuffer[rxBuffer.index(after: prompt)...])
-        appendLog("< \(reply.replacingOccurrences(of: "\n", with: " | "))")
+        if !quietReply { appendLog("< \(reply.replacingOccurrences(of: "\n", with: " | "))") }
         if let c = pending {
             pending = nil
             c.resume(returning: reply)
@@ -425,7 +435,8 @@ final class OBDManager: NSObject, ObservableObject {
     private func startPolling() {
         stopPolling()
         lastSample = nil
-        trip = Trip(start: Date(), end: Date())
+        capturingHead = false
+        if trip == nil { trip = Trip(start: Date(), end: Date()) }
         let fuelPID: String? = supports("5E") ? "5E" : (supports("10") ? "10" : nil)
         let slow = ["05", "0B", "04", "0F", "46", "2F", "44", "7C", "7A", "78"].filter { supports($0) } + ["RV"]
         pollTask = Task {
@@ -536,7 +547,7 @@ final class OBDManager: NSObject, ObservableObject {
             litresPerHour = r
         } else if let maf {
             let load = max(Double(data.load ?? 30) / 100, 0.15)
-            let lam = lambda ?? min(max(1.3 / load, 1.1), 8)
+            let lam = lambda ?? min(max(0.6 / load, 1.2), 4)
             litresPerHour = maf / (14.5 * lam) * 3600 / 832
         }
         data.fuelRate = litresPerHour.map { $0 * store.fuelCalibration }
@@ -697,8 +708,73 @@ final class OBDManager: NSObject, ObservableObject {
     func appendLog(_ line: String) {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
-        log.append("\(f.string(from: Date())) \(line)")
+        let entry = "\(f.string(from: Date())) \(line)"
+        if capturingHead && headLog.count < 150 {
+            headLog.append(entry)
+            return
+        }
+        log.append(entry)
         if log.count > 400 { log.removeFirst(log.count - 400) }
+    }
+
+    var fullLog: [String] {
+        headLog.isEmpty ? log : headLog + ["…"] + log
+    }
+
+    // MARK: - Search for manufacturer-specific data
+
+    /// Identifier ranges (service 22) where Opel and Fiat-derived engine ECUs usually keep live data.
+    private static let scanRanges: [ClosedRange<Int>] = [
+        0x1800...0x19FF, 0x3800...0x38FF, 0x1000...0x17FF, 0x2000...0x24FF, 0x3000...0x33FF, 0x4000...0x45FF,
+    ]
+
+    /// Asks the engine ECU for every identifier in the ranges and keeps the ones it answers.
+    /// Read-only: service 22 only reads values. Live polling is paused meanwhile.
+    func startDataSearch() {
+        guard connection == .connected, !isDemo, scanTask == nil else { return }
+        stopPolling()
+        scanResults = []
+        scanProgress = 0
+        scanTask = Task {
+            let ids = Self.scanRanges.flatMap { Array($0) }
+            var negative = 0, silent = 0
+            let proto = (try? await self.send("ATDPN")) ?? "?"
+            self.scanResults.append("Protocollo \(proto) · PID standard: "
+                + self.supported.sorted().map { String(format: "%02X", $0) }.joined(separator: " "))
+            if let last = proto.last, last == "6" || last == "8" {
+                _ = try? await self.send("ATSH7E0")
+                for (index, id) in ids.enumerated() {
+                    if Task.isCancelled || self.peripheral == nil { break }
+                    let did = String(format: "%04X", id)
+                    if let reply = try? await self.send("22" + did, timeout: 3, quiet: true) {
+                        if let bytes = Self.payloads(reply, prefix: "62" + did).first {
+                            self.scanResults.append(did + ": " + bytes.map { String(format: "%02X", $0) }.joined())
+                            UserDefaults.standard.set(self.scanResults, forKey: "scanResults")
+                        } else if reply.replacingOccurrences(of: " ", with: "").contains("7F22") {
+                            negative += 1
+                        } else {
+                            silent += 1
+                        }
+                    } else {
+                        silent += 1
+                    }
+                    if index % 8 == 0 { self.scanProgress = Double(index) / Double(ids.count) }
+                }
+                _ = try? await self.send("ATSH7DF")
+                self.scanResults.append("Fine · rifiutati \(negative), senza risposta \(silent)"
+                    + (Task.isCancelled ? " · interrotta" : ""))
+            } else {
+                self.scanResults.append("Ricerca non possibile: protocollo non previsto")
+            }
+            UserDefaults.standard.set(self.scanResults, forKey: "scanResults")
+            self.scanProgress = nil
+            self.scanTask = nil
+            if self.peripheral != nil, self.connection == .connected { self.startPolling() }
+        }
+    }
+
+    func stopDataSearch() {
+        scanTask?.cancel()
     }
 
     // MARK: - Bluetooth events (always delivered on the main queue)

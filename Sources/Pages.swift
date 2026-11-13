@@ -358,6 +358,7 @@ struct SettingsView: View {
 
                 Section("Diagnostica") {
                     NavigationLink("Log del lettore") { LogView() }
+                    NavigationLink("Ricerca dati FAP") { DataSearchView() }
                 }
             }
             .navigationTitle("Impostazioni")
@@ -391,7 +392,7 @@ struct LogView: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 2) {
-                ForEach(Array(obd.log.enumerated()), id: \.offset) { _, line in
+                ForEach(Array(obd.fullLog.enumerated()), id: \.offset) { _, line in
                     Text(line)
                         .font(.system(size: 11, design: .monospaced))
                         .textSelection(.enabled)
@@ -404,7 +405,49 @@ struct LogView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
-                Button("Copia") { UIPasteboard.general.string = obd.log.joined(separator: "\n") }
+                Button("Copia") { UIPasteboard.general.string = obd.fullLog.joined(separator: "\n") }
+            }
+        }
+    }
+}
+
+/// Looks for the manufacturer-specific values (DPF soot, regeneration, fuel level...).
+struct DataSearchView: View {
+    @EnvironmentObject private var obd: OBDManager
+
+    var body: some View {
+        List {
+            Section {
+                if let progress = obd.scanProgress {
+                    ProgressView(value: progress) {
+                        Text("Ricerca in corso: \(Int(progress * 100)) %")
+                    }
+                    Button("Interrompi", role: .destructive) { obd.stopDataSearch() }
+                } else {
+                    Button("Avvia ricerca") { obd.startDataSearch() }
+                        .disabled(obd.connection != .connected || obd.isDemo)
+                }
+            } footer: {
+                Text("Chiede alla centralina motore quali dati specifici fornisce. Legge soltanto, non modifica nulla. Dura circa 15 minuti: tieni il motore acceso al minimo, l'auto ferma e l'app aperta. Durante la ricerca il cruscotto resta fermo.")
+            }
+
+            Section("Risultati (\(obd.scanResults.count))") {
+                if obd.scanResults.isEmpty {
+                    Text("Nessun risultato").foregroundStyle(.secondary)
+                }
+                ForEach(Array(obd.scanResults.enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .font(.system(size: 12, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+            }
+        }
+        .navigationTitle("Ricerca dati FAP")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button("Copia") { UIPasteboard.general.string = obd.scanResults.joined(separator: "\n") }
+                    .disabled(obd.scanResults.isEmpty)
             }
         }
     }

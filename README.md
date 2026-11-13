@@ -8,9 +8,15 @@ App iOS personale (stile Sidecar) che legge i dati della centralina tramite un l
 
 ## Stato
 
-**v0.2 (passo 2):** collegamento al lettore ELM327 via Bluetooth LE e cruscotto live con velocità, giri, pressione turbo, temperatura liquido e aria aspirata, carico motore e tensione batteria. L'app ricorda il lettore e si ricollega da sola. Il pulsante **Log** mostra lo scambio di comandi con il lettore (utile per il debug: "Copia" e incollalo nella chat).
+**v0.3:** nuova grafica (stile Apple, accento rosso) e quattro sezioni.
 
-Prossimi passi: Live Activity su CarPlay, codici di errore e storico viaggi, consumi.
+- **Cruscotto:** auto al centro, tachimetro ad arco con giri, riquadri a scelta (consumo istantaneo e medio, turbo, liquido, batteria, FAP, autonomia, temperatura esterna, carico motore, aria aspirata, livello carburante).
+- **FAP:** temperature e pressione differenziale se la centralina le fornisce, rilevamento e storico delle rigenerazioni.
+- **Viaggi:** distanza, durata, consumo e velocità massima di ogni viaggio.
+- **Errori:** lettura e cancellazione dei codici, stato della spia motore.
+- **Impostazioni:** scelta e ordine dei dati, serbatoio, correzione dei consumi, log del lettore, modalità dimostrativa.
+
+Prossimo passo: Live Activity su CarPlay.
 
 ## Come ottenere l'app
 
@@ -31,5 +37,5 @@ Con un Apple ID gratuito l'app scade dopo 7 giorni: basta ripetere il punto 3.
 ## Struttura
 
 - `project.yml`: definizione del progetto per XcodeGen (il `.xcodeproj` viene generato in CI)
-- `Sources/`: codice SwiftUI
+- `Sources/`: codice SwiftUI (`OBDManager` parla con il lettore, `AppStore` salva impostazioni e storico, il resto sono le schermate)
 - `.github/workflows/build.yml`: build non firmata e creazione del file `.ipa`

@@ -11,13 +11,19 @@ struct DiscoveredDevice: Identifiable, Equatable {
 /// Latest values read from the car. nil means "not read yet" or "not supported".
 struct LiveData: Equatable {
     var speed: Int?          // km/h
-    var rpm: Int?            // giri/min
+    var rpm: Int?
     var coolant: Int?        // °C
     var intakeTemp: Int?     // °C
+    var ambient: Int?        // °C
     var load: Int?           // %
     var boost: Double?       // bar, relative to atmosphere
     var voltage: Double?     // V, measured by the adapter
-    var updatedAt: Date?
+    var fuelLevel: Double?   // %
+    var fuelRate: Double?    // l/h, already calibrated
+    var dpfTemp: Double?     // °C
+    var dpfDeltaP: Double?   // kPa
+    var egt: Double?         // °C
+    var mil: Bool?           // engine warning light
 }
 
 enum ConnectionState: Equatable {
@@ -31,7 +37,7 @@ enum ConnectionState: Equatable {
         switch self {
         case .idle: return "Non collegato"
         case .connecting: return "Collegamento al lettore…"
-        case .initializing: return "Inizializzazione ELM327…"
+        case .initializing: return "Inizializzazione…"
         case .connected: return "Collegato"
         case .failed(let reason): return reason
         }
@@ -44,31 +50,58 @@ enum OBDError: Error {
     case noData
 }
 
-/// Talks to an ELM327 adapter over Bluetooth LE and polls standard OBD II PIDs.
-/// Everything runs on the main queue (CoreBluetooth delegate queue and the polling task).
+struct DTC: Identifiable, Equatable {
+    let code: String
+    let pending: Bool
+    var id: String { code + (pending ? "-p" : "") }
+}
+
+/// Talks to an ELM327 adapter over Bluetooth LE and polls OBD II PIDs.
+@MainActor
 final class OBDManager: NSObject, ObservableObject {
     @Published private(set) var bluetoothState: CBManagerState = .unknown
     @Published private(set) var isScanning = false
     @Published private(set) var devices: [DiscoveredDevice] = []
     @Published private(set) var connection: ConnectionState = .idle
+    @Published private(set) var hasDevice = false
+    @Published private(set) var isDemo = false
     @Published private(set) var connectedName: String?
     @Published private(set) var protocolName: String?
+    @Published private(set) var supported: Set<Int> = []
     @Published private(set) var data = LiveData()
+    @Published private(set) var trip: Trip?
+    @Published private(set) var regenSince: Date?
+    @Published private(set) var dtcs: [DTC] = []
+    @Published private(set) var dtcReadAt: Date?
+    @Published private(set) var dtcBusy = false
     @Published private(set) var log: [String] = []
 
+    private let store: AppStore
     private var central: CBCentralManager!
     private var discovered: [UUID: CBPeripheral] = [:]
     private var peripheral: CBPeripheral?
     private var txChar: CBCharacteristic?
     private var rxChar: CBCharacteristic?
     private var servicesPending = 0
+    private var scanID = UUID()
 
     private var rxBuffer = ""
     private var pending: CheckedContinuation<String, Error>?
     private var requestID = UUID()
+    private var busy = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
     private var pollTask: Task<Void, Never>?
+    private var failures: [String: Int] = [:]
     private var baroKPa = 101.0
-    private var pidFailures: [String: Int] = [:]
+    private var maf: Double?
+    private var lambda: Double?
+    private var rawFuelRate: Double?
+    private var lastSample: Date?
+    private var lastPersist = Date()
+    private var hotSince: Date?
+    private var coolSince: Date?
+    private var regenKm = 0.0
 
     private static let lastDeviceKey = "lastDeviceID"
 
@@ -84,8 +117,10 @@ final class OBDManager: NSObject, ObservableObject {
         CBUUID(string: "1800"), CBUUID(string: "1801"), CBUUID(string: "180A"), CBUUID(string: "180F"),
     ]
 
-    override init() {
+    init(store: AppStore) {
+        self.store = store
         super.init()
+        hasDevice = UserDefaults.standard.string(forKey: Self.lastDeviceKey) != nil
         central = CBCentralManager(delegate: self, queue: .main)
     }
 
@@ -100,7 +135,47 @@ final class OBDManager: NSObject, ObservableObject {
         }
     }
 
-    var hasSavedDevice: Bool { UserDefaults.standard.string(forKey: Self.lastDeviceKey) != nil }
+    // MARK: - Derived values
+
+    /// Instant consumption: l/100 km while moving, l/h when (almost) stopped.
+    var instantConsumption: (value: Double, unit: String)? {
+        guard let rate = data.fuelRate else { return nil }
+        let speed = Double(data.speed ?? 0)
+        if speed >= 5 { return (min(rate / speed * 100, 99.9), "l/100 km") }
+        return (rate, "l/h")
+    }
+
+    var averageConsumption: Double? {
+        if isDemo { return 4.6 }
+        return store.totalKm > 1 && store.totalLitres > 0 ? store.totalLitres / store.totalKm * 100 : nil
+    }
+
+    var rangeKm: Double? {
+        guard let level = data.fuelLevel, let avg = averageConsumption, avg > 0.5 else { return nil }
+        return level / 100 * store.tankLitres / avg * 100
+    }
+
+    func supports(_ pid: String) -> Bool {
+        supported.isEmpty || supported.contains(Int(pid, radix: 16) ?? -1)
+    }
+
+    /// false only when the car is connected and has told us it lacks the needed PIDs.
+    func isAvailable(_ metric: Metric) -> Bool {
+        guard connection == .connected, !isDemo, !supported.isEmpty else { return true }
+        let fuel = supports("5E") || supports("10")
+        switch metric {
+        case .fuelInstant, .fuelAverage: return fuel
+        case .boost: return supports("0B")
+        case .coolant: return supports("05")
+        case .battery: return true
+        case .dpf: return supports("7C") || supports("78")
+        case .range: return fuel && supports("2F")
+        case .ambient: return supports("46")
+        case .load: return supports("04")
+        case .intakeTemp: return supports("0F")
+        case .fuelLevel: return supports("2F")
+        }
+    }
 
     // MARK: - Scan and connect
 
@@ -111,12 +186,11 @@ final class OBDManager: NSObject, ObservableObject {
         isScanning = true
         let id = UUID()
         scanID = id
-        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
-            guard let self, self.scanID == id else { return }
-            self.stopScan()
+        Task {
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            if self.scanID == id { self.stopScan() }
         }
     }
-    private var scanID = UUID()
 
     func stopScan() {
         central.stopScan()
@@ -126,6 +200,7 @@ final class OBDManager: NSObject, ObservableObject {
     func connect(_ device: DiscoveredDevice) {
         guard let p = discovered[device.id] else { return }
         UserDefaults.standard.set(device.id.uuidString, forKey: Self.lastDeviceKey)
+        hasDevice = true
         connect(p)
     }
 
@@ -141,7 +216,7 @@ final class OBDManager: NSObject, ObservableObject {
 
     /// Reconnects to the last used adapter. CoreBluetooth waits until it is in range.
     private func reconnectSavedDevice() {
-        guard peripheral == nil,
+        guard peripheral == nil, !isDemo,
               let s = UserDefaults.standard.string(forKey: Self.lastDeviceKey),
               let id = UUID(uuidString: s),
               let p = central.retrievePeripherals(withIdentifiers: [id]).first
@@ -153,8 +228,14 @@ final class OBDManager: NSObject, ObservableObject {
     func disconnectAndForget() {
         UserDefaults.standard.removeObject(forKey: Self.lastDeviceKey)
         stopPolling()
+        finishSession()
         if let p = peripheral { central.cancelPeripheralConnection(p) }
         resetLink()
+        isDemo = false
+        hasDevice = false
+        dtcs = []
+        dtcReadAt = nil
+        data = LiveData()
         connection = .idle
     }
 
@@ -170,10 +251,28 @@ final class OBDManager: NSObject, ObservableObject {
 
     // MARK: - ELM327 commands
 
+    private func acquire() async {
+        if !busy {
+            busy = true
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    private func release() {
+        if waiters.isEmpty {
+            busy = false
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+
     /// Sends one command and returns the adapter's reply (text before the '>' prompt).
+    /// Commands are serialised: only one is on the wire at a time.
     func send(_ command: String, timeout: TimeInterval = 4) async throws -> String {
+        await acquire()
+        defer { release() }
         guard let p = peripheral, let tx = txChar else { throw OBDError.notConnected }
-        failPending(OBDError.timeout)
         rxBuffer = ""
         appendLog("> \(command)")
         let id = UUID()
@@ -183,8 +282,9 @@ final class OBDManager: NSObject, ObservableObject {
             let type: CBCharacteristicWriteType =
                 tx.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
             p.writeValue(Data((command + "\r").utf8), for: tx, type: type)
-            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
-                guard let self, self.requestID == id, self.pending != nil else { return }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                guard self.requestID == id, self.pending != nil else { return }
                 self.appendLog("! timeout per \(command)")
                 self.failPending(OBDError.timeout)
             }
@@ -218,23 +318,57 @@ final class OBDManager: NSObject, ObservableObject {
     /// Mode 01 request; returns the data bytes after "41 <pid>".
     func query(_ pid: String, timeout: TimeInterval = 4) async throws -> [UInt8] {
         let reply = try await send("01" + pid, timeout: timeout)
-        return try Self.parse(reply, prefix: "41" + pid)
+        guard let bytes = Self.payloads(reply, prefix: "41" + pid).first else { throw OBDError.noData }
+        return bytes
     }
 
-    static func parse(_ reply: String, prefix: String) throws -> [UInt8] {
-        for rawLine in reply.uppercased().split(separator: "\n") {
-            let line = rawLine.replacingOccurrences(of: " ", with: "")
-            guard let r = line.range(of: prefix) else { continue }
-            let hex = Array(line[r.upperBound...])
-            var bytes: [UInt8] = []
+    /// Extracts the data bytes that follow `prefix` in each reply line.
+    /// Handles multi-frame replies ("0: 41 78 ..", "1: ..") by joining the frames.
+    nonisolated static func payloads(_ reply: String, prefix: String) -> [[UInt8]] {
+        let lines = reply.uppercased().split(separator: "\n").map { $0.replacingOccurrences(of: " ", with: "") }
+        func bytes(_ hex: Substring) -> [UInt8] {
+            let chars = Array(hex)
+            var out: [UInt8] = []
             var i = 0
-            while i + 1 < hex.count, let b = UInt8(String(hex[i...i + 1]), radix: 16) {
-                bytes.append(b)
+            while i + 1 < chars.count, let b = UInt8(String(chars[i...i + 1]), radix: 16) {
+                out.append(b)
                 i += 2
             }
-            if !bytes.isEmpty { return bytes }
+            return out
         }
-        throw OBDError.noData
+        func isFrame(_ line: String) -> Bool {
+            let c = Array(line)
+            return c.count > 2 && c[1] == ":"
+        }
+        if lines.contains(where: isFrame) {
+            let joined = lines.filter(isFrame).map { String($0.dropFirst(2)) }.joined()
+            guard let r = joined.range(of: prefix) else { return [] }
+            let b = bytes(joined[r.upperBound...])
+            return b.isEmpty ? [] : [b]
+        }
+        var result: [[UInt8]] = []
+        for line in lines {
+            guard let r = line.range(of: prefix) else { continue }
+            let b = bytes(line[r.upperBound...])
+            if !b.isEmpty { result.append(b) }
+        }
+        return result
+    }
+
+    /// Decodes a mode 03/07 CAN payload: one count byte, then two bytes per code.
+    nonisolated static func decodeDTCs(_ payload: [UInt8]) -> [String] {
+        guard payload.count >= 3 else { return [] }
+        let count = Int(payload[0])
+        var codes: [String] = []
+        var i = 1
+        while i + 1 < payload.count, codes.count < max(count, 1) {
+            let a = payload[i], b = payload[i + 1]
+            i += 2
+            if a == 0 && b == 0 { continue }
+            let letter = ["P", "C", "B", "U"][Int(a >> 6)]
+            codes.append(String(format: "%@%d%X%02X", letter, Int((a >> 4) & 0x3), Int(a & 0xF), Int(b)))
+        }
+        return codes
     }
 
     private func initializeAdapter() async {
@@ -245,16 +379,40 @@ final class OBDManager: NSObject, ObservableObject {
             for cmd in ["ATE0", "ATL0", "ATS0", "ATH0", "ATAT1", "ATSP0"] {
                 _ = try await send(cmd)
             }
-            let first = try await send("0100", timeout: 20)
-            if first.contains("UNABLE") || first.contains("NO DATA") || first.contains("ERROR") {
+
+            // Ask the car which PIDs it supports (also wakes up the protocol search).
+            var found: Set<Int> = []
+            var base = 0
+            while base <= 0x60 {
+                let pid = String(format: "%02X", base)
+                guard let reply = try? await send("01" + pid, timeout: base == 0 ? 20 : 5) else { break }
+                let maps = Self.payloads(reply, prefix: "41" + pid).filter { $0.count >= 4 }
+                if maps.isEmpty { break }
+                var more = false
+                for m in maps {
+                    for i in 0..<32 where m[i / 8] & (UInt8(0x80) >> UInt8(i % 8)) != 0 {
+                        found.insert(base + i + 1)
+                        if i == 31 { more = true }
+                    }
+                }
+                if !more { break }
+                base += 0x20
+            }
+            guard !found.isEmpty else {
                 connection = .failed("L'auto non risponde: accendi il quadro e riprova")
                 return
             }
+            supported = found
+            appendLog("PID supportati: " + found.sorted().map { String(format: "%02X", $0) }.joined(separator: " "))
+
             protocolName = try? await send("ATDP")
-            if let b = try? await query("33"), let kPa = b.first, kPa > 50 {
+            if supports("33"), let b = try? await query("33"), let kPa = b.first, kPa > 50 {
                 baroKPa = Double(kPa)
             }
-            pidFailures = [:]
+            if supports("01"), let b = try? await query("01"), let a = b.first {
+                data.mil = a & 0x80 != 0
+            }
+            failures = [:]
             connection = .connected
             startPolling()
         } catch {
@@ -266,33 +424,38 @@ final class OBDManager: NSObject, ObservableObject {
 
     private func startPolling() {
         stopPolling()
-        pollTask = Task { @MainActor [weak self] in
+        lastSample = nil
+        trip = Trip(start: Date(), end: Date())
+        let fuelPID: String? = supports("5E") ? "5E" : (supports("10") ? "10" : nil)
+        let slow = ["05", "0B", "04", "0F", "46", "2F", "44", "7C", "7A", "78"].filter { supports($0) } + ["RV"]
+        pollTask = Task {
             var cycle = 0
-            var consecutiveTimeouts = 0
+            var timeouts = 0
             while !Task.isCancelled {
-                guard let self else { return }
-                // Speed and rpm every cycle, the slower values in rotation.
                 var pids = ["0D", "0C"]
-                let slow = ["05", "0B", "04", "0F", "RV"]
-                pids.append(slow[cycle % slow.count])
-                for pid in pids where !Task.isCancelled {
-                    if (self.pidFailures[pid] ?? 0) >= 3 { continue }
+                if let fuelPID { pids.append(fuelPID) }
+                let alive = slow.filter { (self.failures[$0] ?? 0) < 3 }
+                if !alive.isEmpty { pids.append(alive[cycle % alive.count]) }
+                for pid in pids {
+                    if Task.isCancelled { return }
+                    if (self.failures[pid] ?? 0) >= 3 { continue }
                     do {
                         try await self.read(pid)
-                        consecutiveTimeouts = 0
-                        self.pidFailures[pid] = 0
+                        timeouts = 0
+                        self.failures[pid] = 0
                     } catch OBDError.timeout {
-                        consecutiveTimeouts += 1
+                        timeouts += 1
                     } catch OBDError.notConnected {
                         return
                     } catch {
-                        self.pidFailures[pid, default: 0] += 1
+                        self.failures[pid, default: 0] += 1
                     }
                 }
-                if consecutiveTimeouts >= 6 {
+                if timeouts >= 6 {
                     self.connection = .failed("Il lettore ha smesso di rispondere")
                     return
                 }
+                self.integrate()
                 cycle += 1
             }
         }
@@ -304,29 +467,229 @@ final class OBDManager: NSObject, ObservableObject {
     }
 
     private func read(_ pid: String) async throws {
-        var d = data
-        switch pid {
-        case "RV":
+        if pid == "RV" {
             let reply = try await send("ATRV")
-            let number = reply.filter { "0123456789.".contains($0) }
-            guard let v = Double(number) else { throw OBDError.noData }
-            d.voltage = v
-        default:
-            let b = try await query(pid)
-            switch pid {
-            case "0D": d.speed = Int(b[0])
-            case "0C":
-                guard b.count >= 2 else { throw OBDError.noData }
-                d.rpm = (Int(b[0]) * 256 + Int(b[1])) / 4
-            case "05": d.coolant = Int(b[0]) - 40
-            case "0F": d.intakeTemp = Int(b[0]) - 40
-            case "04": d.load = Int((Double(b[0]) * 100 / 255).rounded())
-            case "0B": d.boost = max(0, (Double(b[0]) - baroKPa) / 100)
-            default: break
+            guard let v = Double(reply.filter { "0123456789.".contains($0) }) else { throw OBDError.noData }
+            data.voltage = v
+            return
+        }
+        let b = try await query(pid)
+        func need(_ n: Int) throws {
+            if b.count < n { throw OBDError.noData }
+        }
+        func word(_ i: Int) -> Double { Double(Int(b[i]) * 256 + Int(b[i + 1])) }
+        switch pid {
+        case "0D": data.speed = Int(b[0])
+        case "0C":
+            try need(2)
+            data.rpm = Int(word(0) / 4)
+        case "05": data.coolant = Int(b[0]) - 40
+        case "0F": data.intakeTemp = Int(b[0]) - 40
+        case "46": data.ambient = Int(b[0]) - 40
+        case "04": data.load = Int((Double(b[0]) * 100 / 255).rounded())
+        case "0B": data.boost = max(0, (Double(b[0]) - baroKPa) / 100)
+        case "2F": data.fuelLevel = Double(b[0]) * 100 / 255
+        case "5E":
+            try need(2)
+            rawFuelRate = word(0) / 20
+            updateFuel()
+        case "10":
+            try need(2)
+            maf = word(0) / 100
+            updateFuel()
+        case "44":
+            try need(2)
+            let l = word(0) / 32768
+            if l > 0.5 { lambda = l }
+        case "7C":
+            // DPF temperature, bank 1: support bits, then inlet and outlet.
+            try need(5)
+            var temps: [Double] = []
+            if b[0] & 0x01 != 0 { temps.append(word(1) / 10 - 40) }
+            if b[0] & 0x02 != 0 { temps.append(word(3) / 10 - 40) }
+            guard let t = temps.max() else { throw OBDError.noData }
+            data.dpfTemp = t
+        case "7A":
+            // DPF pressure, bank 1: support bits, then differential pressure (signed).
+            try need(3)
+            guard b[0] & 0x01 != 0 else { throw OBDError.noData }
+            let raw = Int(b[1]) * 256 + Int(b[2])
+            data.dpfDeltaP = Double(raw > 32767 ? raw - 65536 : raw) / 100
+        case "78":
+            // Exhaust gas temperature, bank 1: support bits, then up to four sensors.
+            try need(3)
+            var temps: [Double] = []
+            for s in 0..<4 where b[0] & (UInt8(1) << UInt8(s)) != 0 && b.count >= 3 + s * 2 {
+                temps.append(word(1 + s * 2) / 10 - 40)
+            }
+            guard let t = temps.max() else { throw OBDError.noData }
+            data.egt = t
+        default: break
+        }
+    }
+
+    /// Fuel rate in l/h. Uses the car's own value when available, otherwise estimates
+    /// it from the air flow (diesel: air mass / (14.5 × lambda), density 832 g/l).
+    private func updateFuel() {
+        var litresPerHour: Double?
+        if let r = rawFuelRate {
+            litresPerHour = r
+        } else if let maf {
+            let load = max(Double(data.load ?? 30) / 100, 0.15)
+            let lam = lambda ?? min(max(1.3 / load, 1.1), 8)
+            litresPerHour = maf / (14.5 * lam) * 3600 / 832
+        }
+        data.fuelRate = litresPerHour.map { $0 * store.fuelCalibration }
+    }
+
+    /// Adds the distance and fuel used since the previous sample to the trip and the totals.
+    private func integrate() {
+        let now = Date()
+        defer { lastSample = now }
+        guard !isDemo, let last = lastSample else { return }
+        let dt = min(now.timeIntervalSince(last), 5)
+        if (data.rpm ?? 0) > 0 {
+            let dkm = Double(data.speed ?? 0) * dt / 3600
+            let dl = (data.fuelRate ?? 0) * dt / 3600
+            store.kmSinceRegen += dkm
+            if data.fuelRate != nil {
+                store.totalKm += dkm
+                store.totalLitres += dl
+            }
+            if var t = trip {
+                t.km += dkm
+                t.litres += dl
+                t.end = now
+                t.maxSpeed = max(t.maxSpeed, data.speed ?? 0)
+                trip = t
             }
         }
-        d.updatedAt = Date()
-        data = d
+        updateRegen(now)
+        if now.timeIntervalSince(lastPersist) > 20 {
+            lastPersist = now
+            saveTrip()
+        }
+    }
+
+    private func saveTrip() {
+        if let t = trip, t.km >= 0.2 { store.upsert(t) }
+        store.persist()
+    }
+
+    /// A regeneration is assumed when the exhaust stays very hot for over a minute.
+    private func updateRegen(_ now: Date) {
+        guard let t = data.dpfTemp ?? data.egt else { return }
+        if regenSince == nil {
+            if t >= 550 {
+                if hotSince == nil { hotSince = now }
+                if let h = hotSince, now.timeIntervalSince(h) > 60 {
+                    regenSince = h
+                    regenKm = store.kmSinceRegen
+                    store.kmSinceRegen = 0
+                    coolSince = nil
+                }
+            } else {
+                hotSince = nil
+            }
+        } else if t < 450 {
+            if coolSince == nil { coolSince = now }
+            if let c = coolSince, now.timeIntervalSince(c) > 30 { endRegen(interrupted: false) }
+        } else {
+            coolSince = nil
+        }
+    }
+
+    private func endRegen(interrupted: Bool) {
+        guard let s = regenSince else { return }
+        let seconds = Int(Date().timeIntervalSince(s))
+        store.addRegen(Regen(start: s, seconds: seconds, kmSincePrevious: regenKm,
+                             completed: !interrupted && seconds >= 300))
+        regenSince = nil
+        hotSince = nil
+        coolSince = nil
+    }
+
+    private func finishSession() {
+        guard !isDemo else { return }
+        if regenSince != nil { endRegen(interrupted: true) }
+        hotSince = nil
+        saveTrip()
+        trip = nil
+    }
+
+    // MARK: - Trouble codes
+
+    func readDTCs() async {
+        if isDemo {
+            dtcReadAt = Date()
+            return
+        }
+        guard connection == .connected, !dtcBusy else { return }
+        dtcBusy = true
+        defer { dtcBusy = false }
+        var found: [DTC] = []
+        for (command, prefix, isPending) in [("03", "43", false), ("07", "47", true)] {
+            guard let reply = try? await send(command, timeout: 6) else { continue }
+            for payload in Self.payloads(reply, prefix: prefix) {
+                for code in Self.decodeDTCs(payload) where !found.contains(where: { $0.code == code }) {
+                    found.append(DTC(code: code, pending: isPending))
+                }
+            }
+        }
+        if let b = try? await query("01"), let a = b.first {
+            data.mil = a & 0x80 != 0
+        }
+        dtcs = found
+        dtcReadAt = Date()
+    }
+
+    func clearDTCs() async {
+        if isDemo {
+            dtcs = []
+            data.mil = false
+            return
+        }
+        guard connection == .connected else { return }
+        _ = try? await send("04", timeout: 6)
+        await readDTCs()
+    }
+
+    // MARK: - Demo
+
+    /// Shows moving, made-up values so the interface can be tried without the car.
+    func startDemo() {
+        stopScan()
+        isDemo = true
+        hasDevice = true
+        connectedName = "Demo"
+        protocolName = "Dati dimostrativi"
+        connection = .connected
+        dtcs = [DTC(code: "P2463", pending: false), DTC(code: "P0401", pending: true)]
+        dtcReadAt = Date()
+        pollTask = Task {
+            var t = 0.0
+            while !Task.isCancelled {
+                t += 0.25
+                let speed = 70 + 35 * sin(t / 4)
+                var d = LiveData()
+                d.speed = Int(speed)
+                d.rpm = Int(1400 + speed * 12 + 120 * sin(t))
+                d.coolant = 89
+                d.intakeTemp = 31
+                d.ambient = 21
+                d.load = Int(45 + 25 * sin(t / 3))
+                d.boost = 0.9 + 0.4 * sin(t / 3)
+                d.voltage = 14.1
+                d.fuelLevel = 62
+                d.fuelRate = 3.6 + 1.8 * sin(t / 3)
+                d.dpfTemp = 312
+                d.dpfDeltaP = 1.4
+                d.egt = 298
+                d.mil = !self.dtcs.isEmpty
+                self.data = d
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
     }
 
     // MARK: - Log
@@ -335,14 +698,12 @@ final class OBDManager: NSObject, ObservableObject {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
         log.append("\(f.string(from: Date())) \(line)")
-        if log.count > 300 { log.removeFirst(log.count - 300) }
+        if log.count > 400 { log.removeFirst(log.count - 400) }
     }
-}
 
-// MARK: - CBCentralManagerDelegate
+    // MARK: - Bluetooth events (always delivered on the main queue)
 
-extension OBDManager: CBCentralManagerDelegate {
-    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+    private func bluetoothStateChanged() {
         bluetoothState = central.state
         if central.state == .poweredOn {
             reconnectSavedDevice()
@@ -351,13 +712,9 @@ extension OBDManager: CBCentralManagerDelegate {
         }
     }
 
-    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
-                        advertisementData: [String: Any], rssi RSSI: NSNumber) {
-        discovered[peripheral.identifier] = peripheral
-        let name = peripheral.name
-            ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String)
-            ?? "Senza nome"
-        let device = DiscoveredDevice(id: peripheral.identifier, name: name, rssi: RSSI.intValue)
+    private func didDiscover(_ p: CBPeripheral, advertisedName: String?, rssi: Int) {
+        discovered[p.identifier] = p
+        let device = DiscoveredDevice(id: p.identifier, name: p.name ?? advertisedName ?? "Senza nome", rssi: rssi)
         if let i = devices.firstIndex(where: { $0.id == device.id }) {
             devices[i] = device
         } else {
@@ -370,78 +727,119 @@ extension OBDManager: CBCentralManagerDelegate {
         }
     }
 
-    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+    private func didConnect(_ p: CBPeripheral) {
         appendLog("Collegato, cerco i servizi")
-        connectedName = peripheral.name
-        peripheral.discoverServices(nil)
+        connectedName = p.name
+        p.discoverServices(nil)
     }
 
-    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        appendLog("! collegamento fallito: \(error?.localizedDescription ?? "?")")
+    private func didFailToConnect(_ message: String) {
+        appendLog("! collegamento fallito: \(message)")
         resetLink()
         connection = .failed("Collegamento fallito, riprova")
     }
 
-    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        appendLog("Scollegato \(error?.localizedDescription ?? "")")
+    private func didDisconnect(_ p: CBPeripheral, message: String) {
+        appendLog("Scollegato \(message)")
         stopPolling()
+        finishSession()
         let wasActive = connection != .idle
         resetLink()
-        guard wasActive else { return }
+        guard wasActive, !isDemo else { return }
         connection = .failed("Lettore scollegato, riprovo…")
         // Wait for the adapter to come back (e.g. engine restarted).
-        connect(peripheral)
+        connect(p)
     }
-}
 
-// MARK: - CBPeripheralDelegate
-
-extension OBDManager: CBPeripheralDelegate {
-    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        let services = peripheral.services ?? []
+    private func didDiscoverServices(_ p: CBPeripheral) {
+        let services = p.services ?? []
         appendLog("Servizi: " + services.map { $0.uuid.uuidString }.joined(separator: ", "))
         servicesPending = services.count
-        for s in services { peripheral.discoverCharacteristics(nil, for: s) }
+        for s in services { p.discoverCharacteristics(nil, for: s) }
     }
 
-    func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+    private func didDiscoverCharacteristics(_ p: CBPeripheral, service: CBService) {
         let chars = service.characteristics ?? []
         appendLog("  \(service.uuid.uuidString): " + chars.map { $0.uuid.uuidString }.joined(separator: ", "))
         servicesPending -= 1
         guard servicesPending == 0 else { return }
-        chooseCharacteristics(peripheral)
-    }
-
-    private func chooseCharacteristics(_ peripheral: CBPeripheral) {
-        let services = peripheral.services ?? []
+        let services = p.services ?? []
         let ordered = Self.preferredServices.compactMap { uuid in services.first { $0.uuid == uuid } }
             + services.filter { !Self.preferredServices.contains($0.uuid) && !Self.ignoredServices.contains($0.uuid) }
         for s in ordered {
-            let chars = s.characteristics ?? []
-            let rx = chars.first { $0.properties.contains(.notify) || $0.properties.contains(.indicate) }
-            let tx = chars.first { $0.properties.contains(.write) || $0.properties.contains(.writeWithoutResponse) }
+            let cs = s.characteristics ?? []
+            let rx = cs.first { $0.properties.contains(.notify) || $0.properties.contains(.indicate) }
+            let tx = cs.first { $0.properties.contains(.write) || $0.properties.contains(.writeWithoutResponse) }
             if let rx, let tx {
                 rxChar = rx
                 txChar = tx
                 appendLog("Uso servizio \(s.uuid.uuidString): RX \(rx.uuid.uuidString), TX \(tx.uuid.uuidString)")
-                peripheral.setNotifyValue(true, for: rx)
+                p.setNotifyValue(true, for: rx)
                 return
             }
         }
         connection = .failed("Questo dispositivo non sembra un lettore OBD")
     }
 
-    func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+    private func didUpdateNotification(_ characteristic: CBCharacteristic, message: String?) {
         guard characteristic == rxChar else { return }
-        if let error {
-            connection = .failed("Errore Bluetooth: \(error.localizedDescription)")
+        if let message {
+            connection = .failed("Errore Bluetooth: \(message)")
             return
         }
-        Task { @MainActor [weak self] in await self?.initializeAdapter() }
+        Task { await self.initializeAdapter() }
     }
 
-    func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+    private func didReceive(_ characteristic: CBCharacteristic) {
         guard characteristic == rxChar, let value = characteristic.value else { return }
         handleIncoming(String(decoding: value, as: UTF8.self))
+    }
+}
+
+// MARK: - CoreBluetooth delegates
+
+extension OBDManager: CBCentralManagerDelegate {
+    nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        MainActor.assumeIsolated { self.bluetoothStateChanged() }
+    }
+
+    nonisolated func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
+                                    advertisementData: [String: Any], rssi RSSI: NSNumber) {
+        let name = advertisementData[CBAdvertisementDataLocalNameKey] as? String
+        let rssi = RSSI.intValue
+        MainActor.assumeIsolated { self.didDiscover(peripheral, advertisedName: name, rssi: rssi) }
+    }
+
+    nonisolated func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        MainActor.assumeIsolated { self.didConnect(peripheral) }
+    }
+
+    nonisolated func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        let message = error?.localizedDescription ?? "?"
+        MainActor.assumeIsolated { self.didFailToConnect(message) }
+    }
+
+    nonisolated func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        let message = error?.localizedDescription ?? ""
+        MainActor.assumeIsolated { self.didDisconnect(peripheral, message: message) }
+    }
+}
+
+extension OBDManager: CBPeripheralDelegate {
+    nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        MainActor.assumeIsolated { self.didDiscoverServices(peripheral) }
+    }
+
+    nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        MainActor.assumeIsolated { self.didDiscoverCharacteristics(peripheral, service: service) }
+    }
+
+    nonisolated func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        let message = error?.localizedDescription
+        MainActor.assumeIsolated { self.didUpdateNotification(characteristic, message: message) }
+    }
+
+    nonisolated func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        MainActor.assumeIsolated { self.didReceive(characteristic) }
     }
 }

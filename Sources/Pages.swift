@@ -459,6 +459,8 @@ struct DataSearchView: View {
                     }
                     Button("Interrompi", role: .destructive) { obd.stopDataSearch() }
                 } else {
+                    Button("Ricerca Opel") { obd.startOpelSearch() }
+                        .disabled(obd.connection != .connected || obd.isDemo)
                     Button("Diagnosi rapida") { obd.startQuickDiagnosis() }
                         .disabled(obd.connection != .connected || obd.isDemo)
                     if obd.canResumeSearch {
@@ -469,7 +471,7 @@ struct DataSearchView: View {
                         .disabled(obd.connection != .connected || obd.isDemo)
                 }
             } footer: {
-                Text("La diagnosi rapida dura meno di un minuto e mostra come risponde la centralina. La ricerca chiede alla centralina motore quali dati specifici fornisce. Legge soltanto, non modifica nulla. Tieni il motore acceso al minimo, l'auto ferma e l'app aperta. Puoi interrompere e riprendere più tardi: i risultati trovati restano salvati. Durante la ricerca il cruscotto resta fermo.")
+                Text("La ricerca Opel dura pochi minuti e legge i dati nel formato usato da questa centralina. La diagnosi rapida dura meno di un minuto e mostra come risponde la centralina. La ricerca chiede alla centralina motore quali dati specifici fornisce. Legge soltanto, non modifica nulla. Tieni il motore acceso al minimo, l'auto ferma e l'app aperta. Puoi interrompere e riprendere più tardi: i risultati trovati restano salvati. Durante la ricerca il cruscotto resta fermo.")
             }
 
             Section("Risultati (\(obd.scanResults.count))") {

@@ -913,6 +913,92 @@ final class OBDManager: NSObject, ObservableObject {
         }
     }
 
+    /// Search in the Opel/GM diagnostic dialect, which this ECU speaks (it answers service 1A).
+    /// Reads every identifier of service 1A and every data packet of service AA once.
+    /// Read-only: AA is asked for a single answer (level 01), nothing stays scheduled.
+    func startOpelSearch() {
+        guard connection == .connected, !isDemo, scanTask == nil else { return }
+        let snapshot = data
+        stopPolling()
+        scanResults = []
+        scanPosition = 0
+        UserDefaults.standard.set(0, forKey: "scanPosition")
+        scanProgress = 0
+        scanRemaining = nil
+        scanTask = Task {
+            func hex(_ v: Int) -> String { String(format: "%02X", v) }
+            func text(_ v: Int?) -> String { v.map(String.init) ?? "–" }
+            self.scanResults.append("Ricerca Opel · giri \(text(snapshot.rpm)), liquido \(text(snapshot.coolant)),"
+                + " aria \(text(snapshot.intakeTemp)), carico \(text(snapshot.load)), velocità \(text(snapshot.speed))")
+            let total = 256.0 + 254.0 * 2
+            var done = 0.0
+            func step() {
+                done += 1
+                if Int(done) % 8 == 0 { self.scanProgress = done / total }
+            }
+            for cmd in ["ATTP6", "ATSH7E0", "ATAT2", "ATST19"] { _ = try? await self.send(cmd) }
+
+            // Service 1A: one-byte identifiers, answer "5A id ...".
+            var refused = 0, silent = 0
+            for id in 0...255 {
+                if Task.isCancelled || self.peripheral == nil { break }
+                let did = hex(id)
+                let reply = (try? await self.send("1A" + did, timeout: 3, quiet: true)) ?? ""
+                if let bytes = Self.payloads(reply, prefix: "5A" + did).first {
+                    let shown = id == 0x90 ? "(telaio, \(bytes.count) byte)" : bytes.map(hex).joined()
+                    self.scanResults.append("1A " + did + ": " + shown)
+                } else if reply.replacingOccurrences(of: " ", with: "").contains("7F1A") {
+                    refused += 1
+                } else {
+                    silent += 1
+                }
+                step()
+            }
+            self.scanResults.append("1A fine · rifiutati \(refused), senza risposta \(silent)")
+            UserDefaults.standard.set(self.scanResults, forKey: "scanResults")
+
+            // Service AA: data packets, answered on a second address (5E8) without the
+            // usual framing, so the adapter is switched to raw frames meanwhile.
+            for cmd in ["ATH1", "ATCAF0", "ATCM5FF", "ATCF5E8"] {
+                let r = (try? await self.send(cmd)) ?? "nessuna risposta"
+                if !r.contains("OK") { self.scanResults.append(cmd + ": " + Self.oneLine(r)) }
+            }
+            // Two passes, so values that change between them stand out.
+            for pass in 1...2 {
+                refused = 0
+                silent = 0
+                var firstOdd: String?
+                for id in 1...254 {
+                    if Task.isCancelled || self.peripheral == nil { break }
+                    let dpid = hex(id)
+                    let reply = (try? await self.send("03AA01" + dpid + "00000000", timeout: 3, quiet: true)) ?? ""
+                    let lines = reply.uppercased().split(separator: "\n")
+                        .map { $0.replacingOccurrences(of: " ", with: "") }
+                    if let line = lines.first(where: { $0.hasPrefix("5E8" + dpid) }) {
+                        self.scanResults.append("AA\(pass) " + dpid + ": " + String(line.dropFirst(5)))
+                    } else if lines.contains(where: { $0.contains("7FAA") }) {
+                        refused += 1
+                    } else {
+                        silent += 1
+                        if firstOdd == nil, let l = lines.first, l != "NODATA" { firstOdd = dpid + " " + l }
+                    }
+                    step()
+                }
+                self.scanResults.append("AA\(pass) fine · rifiutati \(refused), senza risposta \(silent)"
+                    + (firstOdd.map { " · altro: " + String($0.prefix(40)) } ?? ""))
+                UserDefaults.standard.set(self.scanResults, forKey: "scanResults")
+            }
+            for cmd in ["ATAR", "ATCAF1", "ATH0", "ATST32", "ATAT1", "ATSH7DF", "ATSP0"] {
+                _ = try? await self.send(cmd)
+            }
+            self.scanResults.append(Task.isCancelled ? "Interrotta" : "Fine")
+            UserDefaults.standard.set(self.scanResults, forKey: "scanResults")
+            self.scanProgress = nil
+            self.scanTask = nil
+            if self.peripheral != nil, self.connection == .connected { self.startPolling() }
+        }
+    }
+
     /// Keeps only the first 60 characters of a reply, on one line, with the chassis number hidden.
     private static func oneLine(_ reply: String) -> String {
         let flat = reply.replacingOccurrences(of: "\n", with: " | ")

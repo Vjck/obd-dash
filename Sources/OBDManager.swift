@@ -863,12 +863,64 @@ final class OBDManager: NSObject, ObservableObject {
         }
     }
 
+    /// A short series of test requests whose raw answers show which diagnostic "dialect"
+    /// the engine ECU speaks. Read-only. Results go to `scanResults`.
+    func startQuickDiagnosis() {
+        guard connection == .connected, !isDemo, scanTask == nil else { return }
+        stopPolling()
+        scanResults = []
+        scanPosition = 0
+        UserDefaults.standard.set(0, forKey: "scanPosition")
+        scanProgress = 0
+        scanRemaining = nil
+        scanTask = Task {
+            // (label shown, command). Labels starting with "AT" are adapter settings.
+            let steps: [(String, String)] = [
+                ("Lettore", "ATI"), ("Protocollo", "ATDPN"), ("", "ATH1"),
+                ("0100 generale", "0100"),
+                ("", "ATSH7E0"),
+                ("0100 diretta", "0100"),
+                ("3E", "3E"), ("3E00", "3E00"),
+                ("1A80", "1A80"), ("1A90", "1A90"),
+                ("2101", "2101"), ("2180", "2180"),
+                ("22F190", "22F190"), ("22F187", "22F187"),
+                ("", "ATCRA7E8"),
+                ("22F190 filtro", "22F190"),
+                ("", "ATAR"), ("", "ATSH7DF"), ("", "ATTP6"),
+                ("0100 bloccato", "0100"),
+                ("", "ATSP0"), ("", "ATH0"),
+                ("0100 finale", "0100"),
+            ]
+            self.scanResults.append("Diagnosi rapida")
+            for (index, step) in steps.enumerated() {
+                if Task.isCancelled || self.peripheral == nil { break }
+                let reply = try? await self.send(step.1, timeout: step.1 == "0100" ? 15 : 5)
+                if !step.0.isEmpty {
+                    self.scanResults.append(step.0 + ": " + Self.oneLine(reply ?? "nessuna risposta"))
+                }
+                self.scanProgress = Double(index + 1) / Double(steps.count)
+            }
+            if Task.isCancelled {
+                for cmd in ["ATAR", "ATSH7DF", "ATSP0", "ATH0"] { _ = try? await self.send(cmd) }
+                self.scanResults.append("Interrotta")
+            } else {
+                self.scanResults.append("Fine")
+            }
+            UserDefaults.standard.set(self.scanResults, forKey: "scanResults")
+            self.scanProgress = nil
+            self.scanTask = nil
+            if self.peripheral != nil, self.connection == .connected { self.startPolling() }
+        }
+    }
+
     /// Keeps only the first 60 characters of a reply, on one line, with the chassis number hidden.
     private static func oneLine(_ reply: String) -> String {
         let flat = reply.replacingOccurrences(of: "\n", with: " | ")
         let compact = flat.replacingOccurrences(of: " ", with: "")
-        if compact.contains("62F190") { return "risposta positiva (62 F190)" }
-        return String(flat.prefix(60))
+        for (mark, name) in [("62F190", "62 F190"), ("5A90", "5A 90")] where compact.contains(mark) {
+            return "risposta positiva (\(name)), \(compact.count / 2) byte"
+        }
+        return String(flat.prefix(90))
     }
 
     func stopDataSearch() {

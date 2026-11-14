@@ -932,7 +932,7 @@ final class OBDManager: NSObject, ObservableObject {
                 + " aria \(text(snapshot.intakeTemp)), carico \(text(snapshot.load)), velocità \(text(snapshot.speed))")
             let total = 256.0 + 254.0 * 2
             var done = 0.0
-            func step() {
+            @MainActor func step() {
                 done += 1
                 if Int(done) % 8 == 0 { self.scanProgress = done / total }
             }

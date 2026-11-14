@@ -945,7 +945,7 @@ final class OBDManager: NSObject, ObservableObject {
                 let did = hex(id)
                 let reply = (try? await self.send("1A" + did, timeout: 3, quiet: true)) ?? ""
                 if let bytes = Self.payloads(reply, prefix: "5A" + did).first {
-                    let shown = id == 0x90 ? "(telaio, \(bytes.count) byte)" : bytes.map(hex).joined()
+                    let shown = id == 0x90 ? "(telaio, \(bytes.count) byte)" : bytes.map { hex(Int($0)) }.joined()
                     self.scanResults.append("1A " + did + ": " + shown)
                 } else if reply.replacingOccurrences(of: " ", with: "").contains("7F1A") {
                     refused += 1
